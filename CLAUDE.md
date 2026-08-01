@@ -103,6 +103,64 @@ a known divergence, so drifting either way fails.
 dotnet test --filter Category!=Differential   # skip the minutes-long fixture sweep
 ```
 
+## Benchmarks
+
+`bench/README.md` covers the two harnesses in full. In short: both
+implementations are measured in-process with warmup, because a cold CLI pass
+measures JIT far more than the extractor — `bits_pilani_feedback` is ~15 s warm
+and ~190 s cold. Every run prints a CPU line and three calibration kernels
+(scalar int, scalar float, streaming memory) so runs from different VMs can be
+scaled into agreement; the kernels are duplicated in
+`src/PdfInspector.Bench/MachineProfile.cs` and `bench/rust/src/kernels.rs` and
+must stay identical.
+
+```bash
+dotnet build -c Release
+./src/PdfInspector.Bench/bin/Release/net10.0/pdf-inspector-bench --iters 5
+./src/PdfInspector.Bench/bin/Release/net10.0/pdf-inspector-bench --phases FILE.pdf
+./src/PdfInspector.Bench/bin/Release/net10.0/pdf-inspector-bench --detectors FILE.pdf
+```
+
+## Performance notes
+
+**Measure first, and measure the right thing.** Every candidate that looked
+obvious from reading the code has been wrong. The containment dedup pass was
+1.4% of rect detection; the grid coverage sweep was noise; `ClusterRects` showed
+7.4% self time and neither flattening its geometry nor vectorising its pairing
+scan moved the fixture at all (1440, 1439 and 1397 ms against 1375 for the plain
+form — the sampler was charging the group-building phase to the enclosing
+function). Both rewrites were reverted. Use `--phases` and `--detectors`, and a
+`dotnet-trace --profile dotnet-sampled-thread-time` profile attributed to
+callers, not intuition.
+
+**The wins have almost all been duplicated or quadratic work, not slow code.**
+In order of what they were worth:
+
+- The detector inflated the same embedded font stream four times per document by
+  calling `StreamFilters` directly instead of `PdfStream.DecompressedContent` —
+  a quarter of a CJK document.
+- `FormatUrls` copied everything before each match and counted its brackets
+  twice; `ComputeLayoutComplexity` re-filtered every item, rect and line once per
+  page; `MarkUnderlinedItems` re-derived the candidate item set per rule and
+  re-sorted every rule in a row per rule. All quadratic in the page or document.
+- Anything on the per-operand path is called millions of times on a large
+  document. `ShouldUseCp1252SingleByteFallback` allocated two arrays, two
+  closures, a lower-cased name and a subset-stripped name per operand to answer a
+  question about the font's name.
+
+**Allocation shape matters as much as allocation volume.** Growing a `List` from
+zero per item, allocating a trimmed copy of a string only to test its length,
+and taking a `MemoryStream` from 256 bytes to a megabyte by doubling were each
+worth several percent. Size containers from a counting pass, trim with
+`AsSpan().Trim()`, and prefer an array where nothing mutates the result.
+
+`IsChartBarCluster` was the first of these and remains the largest single one:
+geometry read through `Func<RectBox, float>` delegates that cannot inline, a
+quadratic pairing scan written as `family.Count(r => family.Any(s => …))`, and a
+body re-run per rect when it depends only on the anchor's breadth. Flat float
+arrays, one visit per distinct breadth and a vectorised pairing scan took it from
+2617 ms to 121 ms on the 269-page fixture.
+
 ## Debugging
 
 Set `PDFINSPECTOR_LOG` to a comma-separated list of module names for trace output:

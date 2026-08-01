@@ -1,11 +1,18 @@
 namespace PdfInspector.Pdf;
 
 /// <summary>A single content-stream operator with the operands that preceded it.</summary>
-public sealed class PdfOperation(string @operator, List<PdfObject> operands)
+/// <remarks>
+/// The operands are an array rather than a list because nothing downstream
+/// mutates them, and a content stream is mostly operators that take none —
+/// <c>q</c>, <c>Q</c>, <c>BT</c>, <c>ET</c>, <c>W</c>, <c>n</c>. An empty array
+/// is free, where an empty list is still an allocation, and a document whose
+/// content streams run to megabytes has millions of these.
+/// </remarks>
+public sealed class PdfOperation(string @operator, PdfObject[] operands)
 {
     public string Operator { get; } = @operator;
 
-    public List<PdfObject> Operands { get; } = operands;
+    public PdfObject[] Operands { get; } = operands;
 
     public override string ToString() => string.Join(" ", Operands) + " " + Operator;
 }
@@ -20,9 +27,17 @@ public static class ContentStream
     /// </summary>
     public static List<PdfOperation> Decode(byte[] data)
     {
-        var operations = new List<PdfOperation>();
+        // A content-stream operation averages a couple of dozen bytes, so this
+        // lands within a doubling of the final count and skips the growth
+        // sequence a text-heavy page would otherwise walk.
+        var operations = new List<PdfOperation>(Math.Min((data.Length / 24) + 8, 1 << 21));
         var parser = new PdfParser(data);
         var lexer = new PdfLexer(data);
+
+        // Operands accumulate here and are copied out at exact size when the
+        // operator arrives. A fresh list per operation grew 0 -> 4 -> 8 for
+        // every one of them, which was the single largest allocation site in
+        // the extractor.
         var operands = new List<PdfObject>();
 
         while (true)
@@ -62,7 +77,7 @@ public static class ContentStream
                 continue;
             }
 
-            var token = lexer.ReadToken();
+            var token = lexer.ReadTokenSpan();
             if (token.Length == 0)
             {
                 lexer.Position++;
@@ -80,28 +95,38 @@ public static class ContentStream
                 continue;
             }
 
-            switch (token)
+            if (token.SequenceEqual("true"u8))
             {
-                case "true":
-                    operands.Add(PdfBoolean.True);
-                    continue;
-                case "false":
-                    operands.Add(PdfBoolean.False);
-                    continue;
-                case "null":
-                    operands.Add(PdfObject.Null);
-                    continue;
-                case "BI":
-                    // Inline image: the binary payload between ID and EI is not
-                    // PDF syntax, so it must be skipped as raw bytes.
-                    lexer.Position = SkipInlineImage(data, lexer.Position);
-                    operations.Add(new PdfOperation("BI", []));
-                    operands.Clear();
-                    continue;
+                operands.Add(PdfBoolean.True);
+                continue;
             }
 
-            operations.Add(new PdfOperation(token, operands));
-            operands = [];
+            if (token.SequenceEqual("false"u8))
+            {
+                operands.Add(PdfBoolean.False);
+                continue;
+            }
+
+            if (token.SequenceEqual("null"u8))
+            {
+                operands.Add(PdfObject.Null);
+                continue;
+            }
+
+            if (token.SequenceEqual("BI"u8))
+            {
+                // Inline image: the binary payload between ID and EI is not
+                // PDF syntax, so it must be skipped as raw bytes.
+                lexer.Position = SkipInlineImage(data, lexer.Position);
+                operations.Add(new PdfOperation(Operators.Intern("BI"u8), []));
+                operands.Clear();
+                continue;
+            }
+
+            operations.Add(new PdfOperation(
+                Operators.Intern(token),
+                operands.Count == 0 ? [] : [.. operands]));
+            operands.Clear();
         }
 
         return operations;

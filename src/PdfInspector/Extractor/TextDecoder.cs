@@ -1,5 +1,7 @@
 // Ported from reference/src/extractor/fonts.rs
+using System.Buffers;
 using System.Text;
+using System.Text.Unicode;
 using PdfInspector.Pdf;
 using PdfInspector.ToUnicode;
 
@@ -83,6 +85,14 @@ internal sealed class PageFontContext
     /// verdict stays consistent across the page and its forms.
     /// </summary>
     public CMapDecisionCache CMapDecisions { get; init; } = new();
+
+    /// <summary>
+    /// Whether each base font takes the Windows-1252 single-byte fallback. The
+    /// verdict depends only on the font's name, but the question is asked once
+    /// per text-showing operator — millions of times on a large document — and
+    /// answering it strips the subset prefix and lower-cases the name.
+    /// </summary>
+    public Dictionary<string, bool> Cp1252Fallback { get; } = [];
 }
 
 /// <summary>
@@ -108,7 +118,7 @@ internal static class TextDecoder
 
         var bytes = str.Bytes;
         var isType0CidFont = context.Widths.TryGetValue(currentFont, out var widthInfo) && widthInfo.IsCid;
-        var useCp1252Fallback = ShouldUseCp1252SingleByteFallback(baseFontName, isType0CidFont);
+        var useCp1252Fallback = UseCp1252SingleByteFallback(baseFontName, isType0CidFont, context);
 
         var result = Decode(bytes, currentFont, baseFontName, context, isType0CidFont, useCp1252Fallback);
         if (result is null)
@@ -218,7 +228,8 @@ internal static class TextDecoder
 
         // Some producers embed UTF-8 in a single-byte encoded font, writing
         // "José" as the two bytes C3 A9 rather than WinAnsi's E9.
-        if (bytes.Any(b => b > 0x7F) && TryDecodeStrictUtf8(bytes) is { } utf8Text)
+        if (bytes.AsSpan().IndexOfAnyExceptInRange((byte)0x00, (byte)0x7F) >= 0
+            && TryDecodeStrictUtf8(bytes) is { } utf8Text)
         {
             return utf8Text;
         }
@@ -496,7 +507,28 @@ internal static class TextDecoder
         return builder.ToString();
     }
 
-    private static bool ShouldUseCp1252SingleByteFallback(string? baseFontName, bool isType0CidFont)
+    /// <summary>
+    /// TeX and Computer Modern faces, and math and symbol fonts generally, place
+    /// ligatures or symbols in the C1 byte range. Reading those as Windows-1252
+    /// turns "deficiente" into "de…ciente" and "fluid" into "‡uid".
+    /// </summary>
+    private static readonly string[] NonCp1252Prefixes =
+    [
+        "cmr", "cmb", "cmmi", "cmsy", "cmex", "cmtt", "cmss", "cmti",
+        "ecrm", "ecbx", "ecti", "tcrm", "tctt", "msam", "msbm", "ttdc",
+    ];
+
+    private static readonly string[] NonCp1252Names = ["math", "symbol", "dingbat", "emoji"];
+
+    /// <summary>
+    /// Memoised per page context: the answer depends only on the font name, and
+    /// deriving it strips the subset prefix and lower-cases the name — both
+    /// allocations, on a path taken once per text-showing operator.
+    /// </summary>
+    private static bool UseCp1252SingleByteFallback(
+        string? baseFontName,
+        bool isType0CidFont,
+        PageFontContext context)
     {
         if (isType0CidFont)
         {
@@ -508,24 +540,37 @@ internal static class TextDecoder
             return true;
         }
 
-        var fontName = FontEncodings.StripSubsetPrefix(baseFontName).ToLowerInvariant();
-
-        // TeX and Computer Modern faces, and math and symbol fonts generally,
-        // place ligatures or symbols in the C1 byte range. Reading those as
-        // Windows-1252 turns "deficiente" into "de…ciente" and "fluid" into "‡uid".
-        string[] nonCp1252Prefixes =
-        [
-            "cmr", "cmb", "cmmi", "cmsy", "cmex", "cmtt", "cmss", "cmti",
-            "ecrm", "ecbx", "ecti", "tcrm", "tctt", "msam", "msbm", "ttdc",
-        ];
-
-        if (nonCp1252Prefixes.Any(prefix => fontName.StartsWith(prefix, StringComparison.Ordinal)))
+        if (context.Cp1252Fallback.TryGetValue(baseFontName, out var cached))
         {
-            return false;
+            return cached;
         }
 
-        string[] nonCp1252Names = ["math", "symbol", "dingbat", "emoji"];
-        return !nonCp1252Names.Any(name => fontName.Contains(name, StringComparison.Ordinal));
+        var verdict = ShouldUseCp1252SingleByteFallback(baseFontName);
+        context.Cp1252Fallback[baseFontName] = verdict;
+        return verdict;
+    }
+
+    private static bool ShouldUseCp1252SingleByteFallback(string baseFontName)
+    {
+        var fontName = FontEncodings.StripSubsetPrefix(baseFontName).ToLowerInvariant();
+
+        foreach (var prefix in NonCp1252Prefixes)
+        {
+            if (fontName.StartsWith(prefix, StringComparison.Ordinal))
+            {
+                return false;
+            }
+        }
+
+        foreach (var name in NonCp1252Names)
+        {
+            if (fontName.Contains(name, StringComparison.Ordinal))
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     /// <summary>
@@ -775,16 +820,42 @@ internal static class TextDecoder
     }
 
     /// <summary>Decodes strict UTF-8, returning null when the bytes are not valid.</summary>
+    /// <remarks>
+    /// Most single-byte-encoded strings are not UTF-8, so this fails far more
+    /// often than it succeeds — which makes a throwing decoder the wrong tool.
+    /// Exception dispatch alone was 2% of a text-heavy document, and the
+    /// per-call <c>UTF8Encoding</c> added lock traffic on top.
+    /// <see cref="Utf8.ToUtf16"/> returns the same verdict as a status code.
+    /// </remarks>
     private static string? TryDecodeStrictUtf8(byte[] bytes)
     {
+        // A UTF-8 byte yields at most one UTF-16 unit: the only multi-unit form
+        // is the four-byte sequence, and that produces two.
+        char[]? rented = null;
+        Span<char> chars = bytes.Length <= 256
+            ? stackalloc char[256]
+            : (rented = ArrayPool<char>.Shared.Rent(bytes.Length));
+
         try
         {
-            return new UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true)
-                .GetString(bytes);
+            var status = Utf8.ToUtf16(
+                bytes,
+                chars,
+                out var read,
+                out var written,
+                replaceInvalidSequences: false,
+                isFinalBlock: true);
+
+            return status == OperationStatus.Done && read == bytes.Length
+                ? new string(chars[..written])
+                : null;
         }
-        catch (DecoderFallbackException)
+        finally
         {
-            return null;
+            if (rented is not null)
+            {
+                ArrayPool<char>.Shared.Return(rented);
+            }
         }
     }
 }

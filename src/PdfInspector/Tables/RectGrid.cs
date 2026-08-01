@@ -1,4 +1,5 @@
 // Ported from reference/src/tables/detect_rects.rs
+using System.Buffers;
 using System.Text;
 using PdfInspector.Text;
 using PdfInspector.Types;
@@ -45,14 +46,20 @@ internal sealed class UnionFind(int n)
         return root;
     }
 
-    public void Union(int a, int b)
+    /// <summary>
+    /// Merges two components and returns the size of the result, so a caller
+    /// watching for an oversized component does not need a second
+    /// <see cref="ComponentSize"/> — which is another <see cref="Find"/> — right
+    /// after every union.
+    /// </summary>
+    public int Union(int a, int b)
     {
         var ra = Find(a);
         var rb = Find(b);
 
         if (ra == rb)
         {
-            return;
+            return _size[ra];
         }
 
         var newSize = _size[ra] + _size[rb];
@@ -73,6 +80,8 @@ internal sealed class UnionFind(int n)
             _size[ra] = newSize;
             _rank[ra]++;
         }
+
+        return newSize;
     }
 
     public int ComponentSize(int x) => _size[Find(x)];
@@ -92,6 +101,94 @@ internal static class RectGrid
     /// overlap checks are skipped so pathological pages stay fast.
     /// </summary>
     public const int MaxClusterRects = 2000;
+
+    /// <summary>
+    /// Counts grid cells wholly covered by at least one rectangle.
+    /// </summary>
+    /// <remarks>
+    /// Written the obvious way — <c>groupRects.Any(…)</c> per cell — this is
+    /// rows × columns × rectangles, and the closure capturing each cell's edges
+    /// allocates once per cell on top. Walking the rectangles instead inverts
+    /// the cost: a rectangle covers a contiguous block of columns and rows
+    /// (both edge lists are sorted), so each one marks its block directly and
+    /// the answer is the number of marks. Same predicate, same result, without
+    /// the per-cell sweep.
+    /// </remarks>
+    private static uint CountCoveredCells(
+        IReadOnlyList<RectBox> groupRects,
+        List<float> colEdges,
+        List<float> rowEdges,
+        int numCols,
+        int numRows)
+    {
+        const float Tol = 6.0f;
+
+        var cells = ArrayPool<bool>.Shared.Rent(numCols * numRows);
+        try
+        {
+            Array.Clear(cells, 0, numCols * numRows);
+
+            foreach (var r in groupRects)
+            {
+                // Columns ascend, so the covered ones form the run whose own
+                // edges sit inside the rectangle.
+                var firstCol = -1;
+                var lastCol = -2;
+                for (var col = 0; col < numCols; col++)
+                {
+                    if (r.Left <= colEdges[col] + Tol && r.Right >= colEdges[col + 1] - Tol)
+                    {
+                        if (firstCol < 0)
+                        {
+                            firstCol = col;
+                        }
+
+                        lastCol = col;
+                    }
+                    else if (firstCol >= 0)
+                    {
+                        break;
+                    }
+                }
+
+                if (firstCol < 0)
+                {
+                    continue;
+                }
+
+                // Rows descend — the highest y first — but are equally contiguous.
+                for (var row = 0; row < numRows; row++)
+                {
+                    if (r.Bottom > rowEdges[row] + Tol || r.Top < rowEdges[row + 1] - Tol)
+                    {
+                        continue;
+                    }
+
+                    var offset = row * numCols;
+                    for (var col = firstCol; col <= lastCol; col++)
+                    {
+                        cells[offset + col] = true;
+                    }
+                }
+            }
+
+            var filled = 0u;
+            var span = cells.AsSpan(0, numCols * numRows);
+            foreach (var covered in span)
+            {
+                if (covered)
+                {
+                    filled++;
+                }
+            }
+
+            return filled;
+        }
+        finally
+        {
+            ArrayPool<bool>.Shared.Return(cells);
+        }
+    }
 
     /// <summary>True when two rectangles overlap once each is expanded by the tolerance.</summary>
     public static bool RectsOverlap(in RectBox a, in RectBox b, float tol) =>
@@ -125,33 +222,54 @@ internal static class RectGrid
                     continue;
                 }
 
-                uf.Union(i, j);
-
-                if (uf.ComponentSize(i) >= MaxClusterRects)
+                if (uf.Union(i, j) >= MaxClusterRects)
                 {
                     break;
                 }
             }
         }
 
-        var groups = new Dictionary<int, List<int>>();
+        // Resolve every root and size its component before filling anything, so
+        // each surviving group's list is allocated once at its final size. A
+        // cluster runs to thousands of rects, and growing those lists a doubling
+        // at a time was the largest copy in rect detection.
+        var roots = new int[n];
+        var sizes = new Dictionary<int, int>();
         for (var i = 0; i < n; i++)
         {
             var root = uf.Find(i);
-            if (!groups.TryGetValue(root, out var group))
-            {
-                group = [];
-                groups[root] = group;
-            }
+            roots[i] = root;
+            sizes[root] = sizes.TryGetValue(root, out var count) ? count + 1 : 1;
+        }
 
-            group.Add(i);
+        var groups = new Dictionary<int, List<int>>(sizes.Count);
+        foreach (var (root, size) in sizes)
+        {
+            if (size >= minSize)
+            {
+                groups[root] = new List<int>(size);
+            }
+        }
+
+        for (var i = 0; i < n; i++)
+        {
+            if (groups.TryGetValue(roots[i], out var group))
+            {
+                group.Add(i);
+            }
         }
 
         // Ordered by root index, for deterministic output.
-        return [.. groups
-            .Where(kv => kv.Value.Count >= minSize)
-            .OrderBy(kv => kv.Key)
-            .Select(kv => kv.Value)];
+        var order = new List<int>(groups.Keys);
+        order.Sort();
+
+        var result = new List<List<int>>(order.Count);
+        foreach (var root in order)
+        {
+            result.Add(groups[root]);
+        }
+
+        return result;
     }
 
     /// <summary>
@@ -367,30 +485,7 @@ internal static class RectGrid
             return (GridOutcome.Failed, null);
         }
 
-        var filledCells = 0u;
-        for (var row = 0; row < numRows; row++)
-        {
-            var yTop = rowEdges[row];
-            var yBot = rowEdges[row + 1];
-
-            for (var col = 0; col < numCols; col++)
-            {
-                var xLeft = colEdges[col];
-                var xRight = colEdges[col + 1];
-
-                const float Tol = 6.0f;
-                var covered = groupRects.Any(r =>
-                    r.Left <= xLeft + Tol
-                    && r.Right >= xRight - Tol
-                    && r.Bottom <= yTop + Tol
-                    && r.Top >= yBot - Tol);
-
-                if (covered)
-                {
-                    filledCells++;
-                }
-            }
-        }
+        var filledCells = CountCoveredCells(groupRects, colEdges, rowEdges, numCols, numRows);
 
         var totalCells = (float)(numCols * numRows);
         var fillRatio = filledCells / totalCells;
@@ -432,7 +527,7 @@ internal static class RectGrid
             return (GridOutcome.Failed, null);
         }
 
-        var nonEmptyRows = cells.Count(row => row.Any(c => c.Trim().Length > 0));
+        var nonEmptyRows = cells.Count(row => row.Any(HasContent));
         var minRows = strict ? numRows / 2 : 2;
 
         if (nonEmptyRows < minRows)
@@ -441,7 +536,7 @@ internal static class RectGrid
             return (GridOutcome.FewNonEmptyRows, null);
         }
 
-        var nonEmptyCells = cells.SelectMany(row => row).Count(c => c.Trim().Length > 0);
+        var nonEmptyCells = cells.SelectMany(row => row).Count(HasContent);
         var contentRatio = nonEmptyCells / totalCells;
         var minContent = strict ? 0.40f : 0.25f;
 
@@ -471,7 +566,7 @@ internal static class RectGrid
 
         for (var col = 0; col < numCols; col++)
         {
-            if (cells.Any(row => col < row.Count && row[col].Trim().Length > 0))
+            if (cells.Any(row => col < row.Count && HasContent(row[col])))
             {
                 firstNonEmpty ??= col;
                 lastNonEmpty = col;
@@ -518,19 +613,10 @@ internal static class RectGrid
         var numCols = colEdges.Count - 1;
         var numRows = rowEdges.Count - 1;
 
-        var cellItems = new List<List<List<TextItem>>>(numRows);
-        for (var r = 0; r < numRows; r++)
-        {
-            var row = new List<List<TextItem>>(numCols);
-            for (var c = 0; c < numCols; c++)
-            {
-                row.Add([]);
-            }
-
-            cellItems.Add(row);
-        }
+        var numCells = numCols * numRows;
 
         var indices = new List<int>();
+        var cellOfIndex = new List<int>();
 
         for (var idx = 0; idx < items.Count; idx++)
         {
@@ -544,47 +630,78 @@ internal static class RectGrid
             var cx = item.X + (item.Width / 2.0f);
             var cy = item.Y;
 
-            int? col = null;
-            for (var c = 0; c < numCols; c++)
-            {
-                if (cx >= colEdges[c] - 2.0f && cx <= colEdges[c + 1] + 2.0f)
-                {
-                    col = c;
-                    break;
-                }
-            }
-
-            int? row = null;
-            for (var r = 0; r < numRows; r++)
-            {
-                if (cy >= rowEdges[r + 1] - 2.0f && cy <= rowEdges[r] + 2.0f)
-                {
-                    row = r;
-                    break;
-                }
-            }
+            var col = FirstCell(colEdges, numCols, cx, ascending: true);
+            var row = FirstCell(rowEdges, numRows, cy, ascending: false);
 
             if (col is { } c2 && row is { } r2)
             {
-                cellItems[r2][c2].Add(item);
                 indices.Add(idx);
+                cellOfIndex.Add((r2 * numCols) + c2);
             }
         }
 
+        // Count each cell's occupants before filling anything. A grid is mostly
+        // empty cells, and allocating a list for every one of them and growing
+        // the occupied ones a doubling at a time was the largest copy in grid
+        // building — this runs three times per candidate table.
+        var counts = ArrayPool<int>.Shared.Rent(numCells);
+        Array.Clear(counts, 0, numCells);
+        foreach (var cell in cellOfIndex)
+        {
+            counts[cell]++;
+        }
+
+        var buckets = new List<TextItem>?[numCells];
+        for (var i = 0; i < numCells; i++)
+        {
+            if (counts[i] > 0)
+            {
+                buckets[i] = new List<TextItem>(counts[i]);
+            }
+        }
+
+        ArrayPool<int>.Shared.Return(counts);
+
+        for (var k = 0; k < indices.Count; k++)
+        {
+            buckets[cellOfIndex[k]]!.Add(items[indices[k]]);
+        }
+
         var cells = new List<List<string>>(numRows);
-        foreach (var rowItems in cellItems)
+        var text = new StringBuilder();
+
+        for (var r = 0; r < numRows; r++)
         {
             var rowCells = new List<string>(numCols);
-            foreach (var colItems in rowItems)
+            for (var c = 0; c < numCols; c++)
             {
-                colItems.Sort((a, b) =>
+                var colItems = buckets[(r * numCols) + c];
+                if (colItems is null)
                 {
-                    var byY = FloatTotalOrder.Instance.Compare(b.Y, a.Y);
-                    return byY != 0 ? byY : FloatTotalOrder.Instance.Compare(a.X, b.X);
-                });
+                    rowCells.Add(string.Empty);
+                    continue;
+                }
 
-                var text = string.Join(" ", colItems.Select(i => i.Text.Trim()).Where(t => t.Length > 0));
-                rowCells.Add(RemoveInnerDelimiterSpaces(text));
+                colItems.Sort(CellReadingOrder);
+
+                text.Clear();
+                foreach (var item in colItems)
+                {
+                    var trimmed = item.Text.AsSpan().Trim();
+                    if (trimmed.IsEmpty)
+                    {
+                        continue;
+                    }
+
+                    if (text.Length > 0)
+                    {
+                        text.Append(' ');
+                    }
+
+                    text.Append(trimmed);
+                }
+
+                rowCells.Add(RemoveInnerDelimiterSpaces(text.ToString()));
             }
 
             cells.Add(rowCells);
@@ -592,6 +709,55 @@ internal static class RectGrid
 
         return (cells, indices);
     }
+
+    /// <summary>
+    /// The first cell whose edges bracket <paramref name="value"/>, within the
+    /// two-unit tolerance, or null when none does.
+    /// </summary>
+    /// <remarks>
+    /// The linear scan this replaces compared against every edge for every item,
+    /// on every candidate grid. Both edge lists are sorted — columns ascending,
+    /// rows descending — so the far edge's test is monotonic in the cell index
+    /// and a binary search finds the same first match. The near edge is then
+    /// checked once: if it fails there it fails for every later cell too, since
+    /// that edge only moves further away.
+    /// </remarks>
+    private static int? FirstCell(List<float> edges, int count, float value, bool ascending)
+    {
+        // Smallest index whose far edge reaches the value.
+        var lo = 0;
+        var hi = count;
+        while (lo < hi)
+        {
+            var mid = lo + ((hi - lo) / 2);
+            var far = edges[mid + 1];
+            var reaches = ascending ? far >= value - 2.0f : value >= far - 2.0f;
+            if (reaches)
+            {
+                hi = mid;
+            }
+            else
+            {
+                lo = mid + 1;
+            }
+        }
+
+        if (lo >= count)
+        {
+            return null;
+        }
+
+        var near = edges[lo];
+        var brackets = ascending ? value >= near - 2.0f : value <= near + 2.0f;
+        return brackets ? lo : null;
+    }
+
+    /// <summary>Top-to-bottom, then left-to-right — the order text reads inside a cell.</summary>
+    private static readonly Comparison<TextItem> CellReadingOrder = (a, b) =>
+    {
+        var byY = FloatTotalOrder.Instance.Compare(b.Y, a.Y);
+        return byY != 0 ? byY : FloatTotalOrder.Instance.Compare(a.X, b.X);
+    };
 
     /// <summary>Drops the spaces that joining leaves just inside brackets.</summary>
     private static string RemoveInnerDelimiterSpaces(string text)
@@ -622,6 +788,14 @@ internal static class RectGrid
     /// sub-row, so the downstream continuation merge collapses the sub-rows
     /// correctly.
     /// </summary>
+    /// <summary>
+    /// True when a cell holds anything but whitespace. The direct translation,
+    /// <c>cell.Trim().Length > 0</c>, allocates a trimmed copy of every cell
+    /// each time a candidate grid is scored, and each grid is scored several
+    /// times over.
+    /// </summary>
+    private static bool HasContent(string cell) => !cell.AsSpan().Trim().IsEmpty;
+
     private static void PropagateMergedCells(
         List<List<string>> cells,
         List<float> colEdges,
@@ -632,6 +806,8 @@ internal static class RectGrid
         var numCols = colEdges.Count - 1;
         var numRows = rowEdges.Count - 1;
         const float Tol = 6.0f;
+
+        var combined = new StringBuilder();
 
         for (var col = 0; col < numCols; col++)
         {
@@ -651,23 +827,22 @@ internal static class RectGrid
                     continue;
                 }
 
-                // Real overlap is required, not mere tolerance slack: a rect
-                // whose top equals a row's bottom lies entirely below that row,
-                // and counting it would cascade unrelated text into one cell.
-                bool Spans(int r)
-                {
-                    var rowTop = rowEdges[r];
-                    var rowBot = rowEdges[r + 1];
-                    var overlap = MathF.Max(MathF.Min(rowTop, rect.Top) - MathF.Max(rowBot, rect.Bottom), 0.0f);
-                    return overlap > Tol;
-                }
-
                 int? firstRow = null;
                 int? lastRow = null;
 
                 for (var r = 0; r < numRows; r++)
                 {
-                    if (Spans(r))
+                    // Real overlap is required, not mere tolerance slack: a rect
+                    // whose top equals a row's bottom lies entirely below that
+                    // row, and counting it would cascade unrelated text into one
+                    // cell. Written inline rather than as a local function,
+                    // which captured the rect and so allocated once per rect
+                    // per column.
+                    var overlap = MathF.Max(
+                        MathF.Min(rowEdges[r], rect.Top) - MathF.Max(rowEdges[r + 1], rect.Bottom),
+                        0.0f);
+
+                    if (overlap > Tol)
                     {
                         firstRow ??= r;
                         lastRow = r;
@@ -679,11 +854,11 @@ internal static class RectGrid
                     continue;
                 }
 
-                var combined = new StringBuilder();
+                combined.Clear();
                 for (var row = first; row <= last; row++)
                 {
-                    var text = cells[row][col].Trim();
-                    if (text.Length == 0)
+                    var text = cells[row][col].AsSpan().Trim();
+                    if (text.IsEmpty)
                     {
                         continue;
                     }
