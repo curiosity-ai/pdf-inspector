@@ -114,6 +114,29 @@ public sealed class PdfOptions
 }
 
 /// <summary>The library's high-level entry points.</summary>
+/// <remarks>
+/// <para>
+/// <b>Threading.</b> Every method here is safe to call concurrently, on as many
+/// threads as you like, provided each call gets its own input. A call builds its
+/// own document and shares nothing mutable with any other: the process-wide
+/// state is a handful of lookup tables that are immutable once built, plus the
+/// bundled-CMap caches in <c>BuiltinCMaps</c>, which are lock-guarded and hand
+/// out clones. <c>ConcurrencyTests</c> asserts that concurrent runs reproduce
+/// the sequential output exactly.
+/// </para>
+/// <para>
+/// Nothing here parallelises internally, matching the reference crate — it
+/// enables lopdf's <c>rayon</c> feature but never calls a parallel iterator. A
+/// caller wanting to use more than one core should process several documents at
+/// once rather than expect one document to spread itself.
+/// </para>
+/// <para>
+/// Passing the same <c>byte[]</c> buffer to two concurrent calls is fine; it is
+/// only ever read. A <c>PdfDocument</c>, by contrast, caches parsed objects and
+/// decompressed streams as it goes and must stay on one thread — but these entry
+/// points never expose one.
+/// </para>
+/// </remarks>
 public static partial class PdfProcessor
 {
     /// <summary>

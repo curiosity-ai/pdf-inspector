@@ -65,6 +65,11 @@ internal static class BuiltinCMaps
             }
         }
 
+        // Built outside the lock deliberately. Two threads meeting a cold entry
+        // both parse it and one wins the slot, which wastes a parse exactly once
+        // per ordering per process. Holding the lock across the parse instead
+        // would put every document that wants a CJK collection behind whichever
+        // one got there first.
         var cmap = BuildForOrdering(name);
 
         lock (CacheLock)

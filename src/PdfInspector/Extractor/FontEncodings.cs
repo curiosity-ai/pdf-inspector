@@ -71,21 +71,20 @@ internal sealed class SimpleFontEncoding
         switch (resolved)
         {
             case PdfName name:
-                table = (char?[]?)StandardEncodings.ByName(name.Value)?.Clone()
-                    ?? (char?[])DefaultTable(fontDict).Clone();
+                table = StandardEncodings.ByName(name.Value) ?? DefaultTable(fontDict);
                 break;
 
             case PdfDictionary dict:
             {
                 encodingDict = dict;
                 var baseName = doc.GetName(dict, "BaseEncoding");
-                table = (char?[]?)(baseName is null ? null : StandardEncodings.ByName(baseName))?.Clone()
-                    ?? (char?[])DefaultTable(fontDict).Clone();
+                table = (baseName is null ? null : StandardEncodings.ByName(baseName))
+                    ?? DefaultTable(fontDict);
                 break;
             }
 
             default:
-                table = (char?[])DefaultTable(fontDict).Clone();
+                table = DefaultTable(fontDict);
                 break;
         }
 
@@ -119,9 +118,10 @@ internal sealed class SimpleFontEncoding
     }
 
     /// <summary>
-    /// The implicit encoding for a font with no explicit one. Non-symbolic fonts
-    /// use StandardEncoding; the reference build's decoding path then falls back
-    /// to Windows-1252 semantics for the C1 range, which
+    /// The implicit encoding for a font with no explicit one, as a table this
+    /// font owns and <see cref="ApplyDifferences"/> may write into. Non-symbolic
+    /// fonts use StandardEncoding; the reference build's decoding path then
+    /// falls back to Windows-1252 semantics for the C1 range, which
     /// <see cref="TextDecoder"/> applies separately.
     /// </summary>
     private static char?[] DefaultTable(PdfDictionary fontDict)

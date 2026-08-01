@@ -77,6 +77,39 @@ These carry over from the Rust original; see `reference/CLAUDE.md` for the long-
   and table detectors stay imperative.
 - `rayon` parallelism maps to `Parallel.For`/PLINQ, and only where the Rust used it.
 
+## Threading
+
+The public entry points on `PdfProcessor` are safe to call concurrently, one
+document per call. Nothing parallelises internally — the reference enables
+lopdf's `rayon` feature but never calls a parallel iterator, and this port
+follows it — so a caller wanting more than one core should run several
+documents at once.
+
+What makes that safe is that the port adds almost no shared mutable state. The
+one mutable static in the library is `BuiltinCMaps._loading`, and it is
+`[ThreadStatic]`. Everything else process-wide is built once and read
+thereafter: the interned operator table, the small-integer `PdfInteger` cache,
+the `StructRole` cache, `Log`'s enabled set, and the `Lazy<char?[]>` encoding
+tables. The bundled-CMap caches are lock-guarded and hand out `Clone()`s, and
+`ToUnicodeCMap.Clone` is genuinely deep because both containers hold immutable
+elements (`string` values, and a `List` of value tuples).
+
+Two rules keep it that way:
+
+- **A shared table must never escape.** `StandardEncodings` returns copies, not
+  its built tables, because a font's Differences array is applied by writing
+  into the table it was handed. Returning the shared instance would let one
+  font's overrides rewrite the base encoding for every font in every document
+  the process opens. The copy costs nothing — every call site made one anyway.
+- **A `PdfDocument` stays on one thread.** It memoises parsed objects and
+  decompressed streams as it goes, and none of that is synchronised. The public
+  entry points never expose one, so this only matters to code inside the
+  library.
+
+`ConcurrencyTests` asserts that concurrent runs reproduce the sequential output
+byte for byte, rather than merely not throwing — a cache handing out a shared
+instance shows up as wrong text, not as a crash.
+
 ## Validation
 
 The Rust binaries under `reference/target/release/` are the golden reference:

@@ -134,8 +134,24 @@ internal static class StandardEncodings
     private static readonly Lazy<char?[]> WinAnsiTable = new(() => Build(WinAnsiHigh));
     private static readonly Lazy<char?[]> MacRomanTable = new(() => Build(MacRomanHigh));
 
-    /// <summary>Resolves a base-encoding name to its 256-entry table, or null when unknown.</summary>
-    public static char?[]? ByName(string name) => name switch
+    /// <summary>
+    /// Resolves a base-encoding name to a 256-entry table, or null when unknown.
+    /// </summary>
+    /// <remarks>
+    /// The caller gets its own copy, and the built tables never leave this
+    /// class. A font's Differences array is applied by writing into the table it
+    /// was given, so handing out the shared instance would let one font's
+    /// overrides rewrite the base encoding for every font in every document the
+    /// process ever opens, on any thread. The copy is not an extra allocation:
+    /// every call site made one anyway.
+    /// </remarks>
+    public static char?[]? ByName(string name) => Named(name) switch
+    {
+        null => null,
+        var table => (char?[])table.Clone(),
+    };
+
+    private static char?[]? Named(string name) => name switch
     {
         "WinAnsiEncoding" => WinAnsiTable.Value,
         "MacRomanEncoding" => MacRomanTable.Value,
@@ -146,10 +162,9 @@ internal static class StandardEncodings
         _ => null,
     };
 
-    /// <summary>The default when a font declares no encoding.</summary>
-    public static char?[] Standard => StandardTable.Value;
-
-    public static char?[] WinAnsi => WinAnsiTable.Value;
+    /// <summary>The default when a font declares no encoding, as a fresh copy.</summary>
+    /// <inheritdoc cref="ByName" path="/remarks"/>
+    public static char?[] Standard => (char?[])StandardTable.Value.Clone();
 
     private static char?[] Build(string[] high)
     {
