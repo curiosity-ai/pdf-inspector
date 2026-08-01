@@ -1,53 +1,54 @@
-# pdf-inspector
+# pdf-inspector (.NET 10 / C#)
 
-Fast PDF text extraction to structured Markdown. CLI binary: `pdf2md`. Detection binary: `detect-pdf`.
+Fast PDF text extraction to structured Markdown. A port of the original Rust crate,
+which is preserved verbatim under `reference/` and remains the behavioural source of truth.
 
 ## Build & Test
 
 ```bash
-cargo fmt                                    # format
-cargo clippy -- -D warnings                  # lint (enforced, zero warnings)
-cargo test                                   # unit + integration tests (267+ unit, 73+ integration)
-cargo build --release                        # release binary for benchmarks
+dotnet build                                  # build all projects
+dotnet test                                   # unit + integration tests
+dotnet build -c Release                       # release build for benchmarks
 ```
 
-All three must pass before committing.
+Warnings are errors (`Directory.Build.props`), so a clean build is required before committing.
 
-## Binaries
-
-- `pdf2md` — extract PDF → Markdown. Supports `--json` for structured output.
-- `detect-pdf` — classify PDF type (TextBased/Scanned/Mixed/ImageBased). Supports `--analyze --json`.
-
-## Architecture
+## Layout
 
 ```
-src/
-  lib.rs                        – public API, process_pdf_with_options, encoding issue detection
-  detector.rs                   – PDF type classification, tiled-scan detection, page sampling
-  types.rs                      – TextItem, TextLine, PdfRect, PdfLine
-  tounicode.rs                  – CMap/ToUnicode parsing, CID decoding
-  text_utils.rs                 – CJK/RTL handling, Otsu threshold, ligature expansion, NFKC
-  extractor/
-    mod.rs                      – top-level extraction orchestrator
-    content_stream.rs           – PDF operator state machine (Tj/TJ/Td/Tm/q/Q)
-    fonts.rs                    – font width/encoding, CMapDecisionCache, TrueType cmap fallback
-    layout.rs                   – column detection (histogram), newspaper/tabular classification,
-                                  spanning-line pre-masking, sidebar detection
-  tables/
-    detect_rects.rs             – rect-based table detection (union-find clustering)
-    detect_heuristic.rs         – heuristic table detection (gap-histogram, body-font tables)
-    detect_lines.rs             – line-based table detection (H/V line grids)
-    grid.rs                     – column/row boundaries, cell assignment
-    format.rs                   – table→Markdown formatting, continuation row merging
-  markdown/
-    convert.rs                  – core line→Markdown loop, struct-tree role support
-    analysis.rs                 – font stats, heading tiers, paragraph thresholds
-    classify.rs                 – line classification (header, list, code, caption)
-    preprocess.rs               – drop cap merging, heading line merging
-    postprocess.rs              – dot leaders, hyphenation, page numbers, URL formatting
+reference/                     – the original Rust crate, unmodified. Behavioural source of truth.
+src/PdfInspector/              – the library
+src/PdfInspector.Cli/          – pdf2md and detect-pdf entry points
+tests/PdfInspector.Tests/      – xUnit unit + integration tests
+```
+
+## Library structure
+
+```
+src/PdfInspector/
+  Pdf/                         – PDF core, replacing the Rust build's `lopdf` dependency
+    PdfObject.cs               – object model (Null/Bool/Integer/Real/String/Name/Array/Dict/Stream/Reference)
+    PdfLexer.cs                – byte-level tokeniser shared by the file and content-stream parsers
+    PdfParser.cs               – object parser; deliberately permissive about malformed files
+    PdfDocument.cs             – xref tables + xref streams, object streams, page tree, recovery scan
+    StreamFilters.cs           – Flate/LZW/ASCIIHex/ASCII85/RunLength + PNG/TIFF predictors
+    PdfDecryptor.cs            – standard security handler, revisions 2–6 (RC4, AESV2, AESV3)
+    ContentStream.cs           – operator decoding, including inline-image skipping
+  Types/                       – TextItem, TextLine, PdfRect, PdfLine, LayoutComplexity
+  Text/                        – CJK/RTL handling, Otsu threshold, ligatures, NFKC, glyph-name tables
+  ToUnicode/                   – CMap/ToUnicode parsing, CID decoding, bundled Adobe CMaps
+  Extractor/                   – content-stream state machine, fonts, layout, XObjects, links, reading order
+  Tables/                      – rect / line / heuristic / struct table detection, grid building, formatting
+  Markdown/                    – line→Markdown conversion, heading tiers, classification, pre/post-processing
+  Detector/                    – PDF type classification, tiled-scan detection, page sampling
+  Regions/                     – region-scoped text/table extraction, vector grids, TSR tables
+  Quality/                     – garbage, CID and encoding-issue detection
+  Structure/                   – tagged-PDF structure tree and roles
 ```
 
 ## Key design decisions
+
+These carry over from the Rust original; see `reference/CLAUDE.md` for the long-form rationale.
 
 - **Primary audience is AI agents.** Output optimized for token efficiency and semantic quality, not visual formatting. No cosmetic padding.
 - **Three table detection strategies** run in priority order: rect-based → line-based → heuristic. First valid result wins.
@@ -57,24 +58,56 @@ src/
 - **Garbage text upgrade** reclassifies Mixed PDFs as Scanned when extracted text is <50% alphanumeric.
 - **Tagged PDF support** uses structure tree roles (H1-H6, P, L, Code, BlockQuote) when available, falling back to font-size heuristics.
 
-## Testing
+## Porting conventions
 
-- **Unit tests**: inline `#[cfg(test)] mod tests` in each module with synthetic data.
-- **Integration tests**: `tests/integration_tests.rs` with fixture PDFs in `tests/fixtures/`.
-- **Regression suite**: sibling repo `pdf-evals` with 187+ snapshot PDFs. Run `cargo build --release` then `bench.py test` in that repo before committing.
-- **Semantic quality**: run `bench.py score` in `pdf-evals` for the semantic verdict (TEDS + MHS + reading order + char/word + list preservation, composited). Character-level diff alone misclassifies structural improvements (e.g., column-detection rewrites) as regressions — `score` is the tie-breaker. See `pdf-evals/CLAUDE.md` "Semantic scoring".
+- The Rust module a file was ported from is named in a header comment; keep that link intact.
+- Rust `Option<T>` becomes a nullable reference or `T?`; `Result<T, E>` becomes an exception
+  or a `bool TryX(out T)` pair, whichever reads better at the call site.
+- `f32` is preserved as `float` throughout. The layout and table heuristics compare
+  against tuned thresholds, so widening to `double` changes output. Sum floats with
+  `FloatMath.SumF32`, never LINQ's `Sum`: LINQ accumulates in double and rounds once
+  at the end, and a single ulp is enough to move a table's row band off the text
+  baseline it should coincide with, which reorders the output.
+- `str::len()` is UTF-8 bytes while `string.Length` is UTF-16 units. Where the Rust
+  compares a length against a tuned threshold, use `TextUtils.ByteLength`.
+- Rust structs are values; C# classes are references. Clone before mutating anything
+  that also reaches another consumer — two lists holding the same `PdfRect` will
+  otherwise transform it twice.
+- Iterator chains become LINQ only where it stays readable; hot loops in the extractor
+  and table detectors stay imperative.
+- `rayon` parallelism maps to `Parallel.For`/PLINQ, and only where the Rust used it.
+
+## Validation
+
+The Rust binaries under `reference/target/release/` are the golden reference:
+
+```bash
+cargo build --release --bins                          # in reference/
+./reference/target/release/pdf2md FILE.pdf            # golden Markdown
+dotnet run --project src/PdfInspector.Cli -- pdf2md FILE.pdf
+```
+
+`tests/PdfInspector.Tests` includes a differential suite that runs both over
+`reference/tests/fixtures` and compares. Snapshots in `reference/tests/snapshots`
+are checked directly. Both differential tests skip themselves when the Rust
+binaries have not been built.
+
+20 of the 21 open fixtures are byte-identical to the reference binary, and
+detection output matches on all of them. The exception is `2013-app2.pdf`: the
+reference's parser cannot read page 7 at all, so it — and its pinned snapshot —
+omit that page's rows, while this port's recovery scan reads them. `SnapshotTests`
+pins the exact shape of that addition and `DifferentialMarkdownTests` lists it as
+a known divergence, so drifting either way fails.
+
+```bash
+dotnet test --filter Category!=Differential   # skip the minutes-long fixture sweep
+```
 
 ## Debugging
 
+Set `PDFINSPECTOR_LOG` to a comma-separated list of module names for trace output:
+
 ```bash
-RUST_LOG=pdf_inspector::extractor::layout=debug cargo run --bin pdf2md -- file.pdf
-RUST_LOG=pdf_inspector::tables=debug cargo run --bin pdf2md -- file.pdf
-RUST_LOG=pdf_inspector::detector=debug cargo run --release --bin detect-pdf -- file.pdf
+PDFINSPECTOR_LOG=layout dotnet run --project src/PdfInspector.Cli -- pdf2md file.pdf
+PDFINSPECTOR_LOG=tables,detector dotnet run --project src/PdfInspector.Cli -- pdf2md file.pdf
 ```
-
-## Conventions
-
-- Clippy: use `is_some_and(...)` not `map_or(false, ...)`
-- lopdf quirk: `ParseError` is private — match by string for `InvalidFileHeader`
-- Column limit for tables: 25 (wide statistical tables)
-- `propagate_merged_cells` skipped for >10 columns (spanning rects = background fills)
